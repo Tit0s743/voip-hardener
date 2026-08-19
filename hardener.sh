@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==============================================================================
-# VoIP Server Hardening Script v2.0 (Asterisk + GoIP/DBL)
+# VoIP Server Hardening Script v2.1 (Asterisk + GoIP/DBL)
 # URL: https://raw.githubusercontent.com/Tit0s743/voip-hardener/main/hardener.sh
 # Usage: curl -sSL <URL> | sudo bash
 # ==============================================================================
@@ -20,7 +20,7 @@ log_error() { echo -e "${RED}[✘]${NC} $1"; exit 1; }
 log_step()  { echo -e "\n${CYAN}━━━ $1 ━━━${NC}"; }
 
 echo -e "${GREEN}============================================================${NC}"
-echo -e "${GREEN}  VoIP Server Hardening Script v2.0${NC}"
+echo -e "${GREEN}  VoIP Server Hardening Script v2.1${NC}"
 echo -e "${GREEN}  Asterisk + GoIP/DBL Protection${NC}"
 echo -e "${GREEN}============================================================${NC}"
 echo -e "  $(date '+%Y-%m-%d %H:%M:%S') | $(hostname)"
@@ -60,9 +60,8 @@ fi
 # === 4. ОЖИДАНИЕ APT LOCK И ОБНОВЛЕНИЕ СИСТЕМЫ ===
 log_step "4/8 Обновление системы и установка зависимостей"
 
-# Функция ожидания освобождения apt lock
 wait_for_apt() {
-  local timeout=300  # 5 минут максимум
+  local timeout=300
   local elapsed=0
   local interval=5
 
@@ -84,13 +83,10 @@ wait_for_apt() {
   fi
 }
 
-# Убиваем все интерактивные вопросы (ключевое для iptables-persistent!)
 export DEBIAN_FRONTEND=noninteractive
 
-# Ждём apt lock
 wait_for_apt
 
-# Фиксим возможные битые пакеты от прошлых сбоев
 dpkg --configure -a 2>/dev/null || true
 apt-get -f install -y -qq 2>/dev/null || true
 
@@ -112,8 +108,12 @@ for pkg in $PACKAGES; do
   fi
 done
 
-# === 5. ПРОВЕРКА ASTERISK ===
-log_step "5/8 Проверка Asterisk"
+# === 5. ПРОВЕРКА ASTERISK И ОПРЕДЕЛЕНИЕ ПОРТОВ ===
+log_step "5/8 Проверка Asterisk и определение SIP-портов"
+
+# Массив для хранения всех найденных SIP-портов
+declare -a SIP_PORTS=()
+
 if command -v asterisk &> /dev/null; then
   AST_VER=$(asterisk -V 2>/dev/null || echo "unknown")
   log_info "Asterisk найден: $AST_VER"
@@ -121,6 +121,62 @@ else
   log_warn "Asterisk НЕ установлен! Скрипт настроит защиту, но"
   log_warn "Fail2ban-фильтр asterisk не будет работать до установки."
 fi
+
+# Функция извлечения портов из pjsip.conf
+extract_pjsip_ports() {
+  local config_file="$1"
+  if [ -f "$config_file" ]; then
+    # Ищем строки вида: bind=0.0.0.0:5090 или bind=0.0.0.0:5060
+    grep -E "^bind=" "$config_file" 2>/dev/null | grep -oE ":[0-9]+" | tr -d ':' | while read -r port; do
+      echo "$port"
+    done
+  fi
+}
+
+# Функция извлечения портов из sip.conf
+extract_sip_ports() {
+  local config_file="$1"
+  if [ -f "$config_file" ]; then
+    # Ищем строки вида: bindport=5060 или bindport=5090
+    grep -E "^bindport=" "$config_file" 2>/dev/null | cut -d= -f2 | while read -r port; do
+      echo "$port"
+    done
+  fi
+}
+
+# Извлекаем порты из pjsip.conf
+PJSIP_CONF="/etc/asterisk/pjsip.conf"
+if [ -f "$PJSIP_CONF" ]; then
+  log_info "Анализирую $PJSIP_CONF..."
+  while read -r port; do
+    if [ -n "$port" ]; then
+      SIP_PORTS+=("$port")
+      log_info "  Найден PJSIP порт: $port"
+    fi
+  done < <(extract_pjsip_ports "$PJSIP_CONF")
+fi
+
+# Извлекаем порты из sip.conf
+SIP_CONF="/etc/asterisk/sip.conf"
+if [ -f "$SIP_CONF" ]; then
+  log_info "Анализирую $SIP_CONF..."
+  while read -r port; do
+    if [ -n "$port" ]; then
+      SIP_PORTS+=("$port")
+      log_info "  Найден SIP порт: $port"
+    fi
+  done < <(extract_sip_ports "$SIP_CONF")
+fi
+
+# Если порты не найдены, добавляем стандартный 5060
+if [ ${#SIP_PORTS[@]} -eq 0 ]; then
+  SIP_PORTS=(5060)
+  log_warn "Кастомные порты не найдены — использую стандартный 5060"
+fi
+
+# Убираем дубликаты
+SIP_PORTS=($(echo "${SIP_PORTS[@]}" | tr ' ' '\n' | sort -u | tr '\n' ' '))
+log_info "Итоговый список SIP-портов: ${SIP_PORTS[*]}"
 
 # Проверяем/создаём директорию логов Asterisk
 AST_LOG_DIR="/var/log/asterisk"
@@ -160,11 +216,16 @@ SSH_PORT=${SSH_PORT:-22}
 ufw allow "${SSH_PORT}/tcp" comment 'SSH' > /dev/null
 log_info "SSH: порт ${SSH_PORT}/tcp открыт"
 
-# SIP
-ufw allow 5060/udp comment 'SIP UDP' > /dev/null
-ufw allow 5060/tcp comment 'SIP TCP' > /dev/null
+# SIP (открываем все найденные порты)
+for port in "${SIP_PORTS[@]}"; do
+  ufw allow "${port}/udp" comment "SIP UDP (port $port)" > /dev/null
+  ufw allow "${port}/tcp" comment "SIP TCP (port $port)" > /dev/null
+  log_info "SIP: ${port}/udp и ${port}/tcp открыты"
+done
+
+# SIPS TLS (стандартный порт 5061)
 ufw allow 5061/tcp comment 'SIPS TLS' > /dev/null
-log_info "SIP: 5060/udp, 5060/tcp, 5061/tcp открыты"
+log_info "SIPS TLS: 5061/tcp открыт"
 
 # RTP
 RTP_START=10000
@@ -186,7 +247,7 @@ ufw allow 80/tcp comment 'HTTP' > /dev/null
 ufw allow 443/tcp comment 'HTTPS' > /dev/null
 log_info "Web: 80/tcp, 443/tcp открыты"
 
-# IAX2 (если используется)
+# IAX2
 ufw allow 4569/udp comment 'IAX2' > /dev/null
 log_info "IAX2: 4569/udp открыт"
 
@@ -196,12 +257,18 @@ log_info "UFW включён и активен"
 # === 7. НАСТРОЙКА FAIL2BAN ===
 log_step "7/8 Настройка Fail2ban"
 
-# Определяем IP сервера для подсказки
 SERVER_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+
+# Формируем строку портов для Fail2ban (через запятую)
+FAIL2BAN_PORTS=$(IFS=,; echo "${SIP_PORTS[*]}")
+# Добавляем 5061 если его нет в списке
+if [[ ! " ${SIP_PORTS[@]} " =~ "5061" ]]; then
+  FAIL2BAN_PORTS="${FAIL2BAN_PORTS},5061"
+fi
 
 cat <<EOF > /etc/fail2ban/jail.local
 # ==============================================================================
-# Fail2ban Configuration — VoIP Hardener v2.0
+# Fail2ban Configuration — VoIP Hardener v2.1
 # Generated: $(date '+%Y-%m-%d %H:%M:%S')
 # ==============================================================================
 
@@ -224,7 +291,7 @@ bantime  = 86400
 
 [asterisk]
 enabled  = true
-port     = 5060,5061
+port     = ${FAIL2BAN_PORTS}
 filter   = asterisk
 logpath  = /var/log/asterisk/messages
 maxretry = 5
@@ -236,7 +303,7 @@ filter   = recidive
 logpath  = /var/log/fail2ban.log
 action   = iptables-allports[name=recidive]
 bantime  = 2592000
-findtime = 86400
+findtime  = 86400
 maxretry = 3
 EOF
 
@@ -276,6 +343,7 @@ echo -e "${CYAN}📊 Статус защиты:${NC}"
 echo -e "  UFW:      $(ufw status | head -1)"
 echo -e "  Fail2ban: $(systemctl is-active fail2ban)"
 echo -e "  SSH порт: ${SSH_PORT}"
+echo -e "  SIP порты: ${SIP_PORTS[*]}"
 echo -e "  RTP:      ${RTP_START}:${RTP_END}/udp"
 echo -e "  IP сервера: ${SERVER_IP:-unknown}"
 echo ""
